@@ -1,0 +1,156 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include "DHT.h"
+
+// WiFi
+const char* ssid = "---";
+const char* password = "---";
+
+// MQTT broker
+const char* mqtt_server = "192.168.101.77";
+const int mqtt_port = 1883;
+
+// Device info
+const char* deviceId = "esp32-01";
+
+// Pins
+#define SOIL_PIN 32        // soil moisture analog input
+#define DHTPIN 4           // DHT22 data pin
+#define DHTTYPE DHT22
+
+DHT dht(DHTPIN, DHTTYPE);
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// Topics
+String baseTopic = String("sensors/") + deviceId;
+String topicSoil = baseTopic + "/soil";
+String topicDHT = baseTopic + "/dht";
+
+unsigned long lastSend = 0;
+const unsigned long SEND_INTERVAL = 15UL * 1000UL; // kirim tiap 15 detik
+
+void setup_wifi() {
+  delay(10);
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+  int attempt = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    attempt++;
+    if (attempt > 40) { // timeout -> reboot
+      Serial.println(" WiFi connect failed, restarting...");
+      ESP.restart();
+    }
+  }
+  Serial.println("");
+  Serial.print("WiFi connected, IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void reconnect() {
+  // Loop until connected
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    String clientId = String(deviceId) + "-" + String(random(0xffff), HEX);
+    if (client.connect(clientId.c_str())) {
+      Serial.println("connected");
+      // no subscribe needed (device only publishes)
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 2 seconds");
+      delay(2000);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  dht.begin();
+  setup_wifi();
+  client.setServer(mqtt_server, mqtt_port);
+  pinMode(SOIL_PIN, INPUT);
+  // stabilize sensor
+  delay(2000);
+}
+
+float readSoilPercent() {
+  // baca ADC 0..4095 -> konversi ke percent
+  int raw = analogRead(SOIL_PIN);
+  // jika Anda memakai sensor resistive, kalibrasi min/max sesuai rangkaian.
+  float percent = 100.0 * (1.0 - ((float)raw / 4095.0)); // asumsi kering=0 -> 100%? sesuaikan
+  if (percent < 0) percent = 0;
+  if (percent > 100) percent = 100;
+  return percent;
+}
+
+void publishJSON(const String &topic, const String &payload) {
+  if (!client.connected()) {
+    reconnect();
+  }
+  bool ok = client.publish(topic.c_str(), payload.c_str());
+  Serial.print("Published to ");
+  Serial.print(topic);
+  Serial.print(": ");
+  Serial.println(payload);
+  if (!ok) {
+    Serial.println("Publish failed");
+  }
+}
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    setup_wifi();
+  }
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+
+  unsigned long now = millis();
+  if (now - lastSend >= SEND_INTERVAL) {
+    lastSend = now;
+
+    // Baca soil
+    float soilPercent = readSoilPercent();
+
+    // Baca DHT
+    float humidity = dht.readHumidity();
+    float temperature = dht.readTemperature(); // Celsius
+
+    // Cek pembacaan valid
+    if (isnan(humidity) || isnan(temperature)) {
+      Serial.println("Failed to read from DHT sensor!");
+    } else {
+      // Buat payload JSON
+      String payloadDHT = "{";
+      payloadDHT += "\"device\":\"" + String(deviceId) + "\",";
+      payloadDHT += "\"sensor\":\"dht22\",";
+      payloadDHT += "\"temperature\":" + String(temperature, 2) + ",";
+      payloadDHT += "\"humidity\":" + String(humidity, 2) + ",";
+      payloadDHT += "\"timestamp\": " + String((unsigned long)(time(NULL))) ;
+      payloadDHT += "}";
+
+      publishJSON(topicDHT, payloadDHT);
+    }
+
+    // Soil payload
+    String payloadSoil = "{";
+    payloadSoil += "\"device\":\"" + String(deviceId) + "\",";
+    payloadSoil += "\"sensor\":\"soil\",";
+    payloadSoil += "\"soil_percent\":" + String(soilPercent, 2) + ",";
+    payloadSoil += "\"raw\":" + String(analogRead(SOIL_PIN)) + ",";
+    payloadSoil += "\"timestamp\": " + String((unsigned long)(time(NULL))) ;
+    payloadSoil += "}";
+
+    publishJSON(topicSoil, payloadSoil);
+  }
+
+  // other tasks
+  delay(10);
+}
